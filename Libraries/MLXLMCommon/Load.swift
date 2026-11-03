@@ -521,7 +521,11 @@ public func loadWeights(
     // quantize if needed
     if let perLayerQuantization = checkpoint.perLayerQuantization {
         quantize(model: model) { path, module in
-            if weights["\(path).scales"] != nil {
+            // llm-mesh: also quantize out-of-slice layers so MLX's module-update array has no
+            // leading holes (a slice starting above layer 0 otherwise traps in quantize).
+            if weights["\(path).scales"] != nil
+                || PipelineSliceConfig.shared.dropsLayer(key: path + ".")
+            {
                 // Normalize MTP module paths: the Swift module tree indexes MTP
                 // prediction layers as "mtp.<depth>.layers...." (e.g. "mtp.0.layers...."
                 // for the first/only next-token-prediction depth), but checkpoints
@@ -573,13 +577,18 @@ public func loadWeights(
     // (they are paged from NVMe on demand). Using .all would reject the load.
     // .noUnusedKeys still catches genuinely stray/misspelled keys without requiring
     // every @ModuleInfo slot to be populated up-front.
+    if pipelineSliced {
+        // Scalar placeholders for every parameter this slice never loads (see PipelineSlice.swift).
+        for key in outOfSliceParameterKeys(model) where weights[key] == nil {
+            weights[key] = MLXArray(0)
+        }
+    }
     let parameters = ModuleParameters.unflattened(weights)
     if streamsThisModel || pipelineSliced {
         // Expert weights are intentionally absent — paged from SSD on demand.
         // .noUnusedKeys still rejects stray/misspelled keys without requiring
         // every @ModuleInfo slot to be pre-populated.
         try model.update(parameters: parameters, verify: .noUnusedKeys)
-        if pipelineSliced { releaseOutOfSliceParameters(model) }
     } else {
         try model.update(parameters: parameters, verify: .all)
     }

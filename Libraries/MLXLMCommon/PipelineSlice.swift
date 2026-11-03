@@ -64,22 +64,19 @@ public protocol PipelineSliceable: AnyObject {
     var pipelineRange: Range<Int>? { get set }
 }
 
-/// After weights are applied, replace every parameter this slice does not use with a scalar.
-/// Un-loaded layers still hold lazily-initialised full-size placeholders, and `eval(model)`
-/// would otherwise materialise them (full fp16 layers, plus lm_head on non-final stages).
-public func releaseOutOfSliceParameters(_ model: Module) {
+/// Keys of parameters this slice does not use (layers outside the range, lm_head on a
+/// non-final stage, embed_tokens on a middle stage). The loader gives each a scalar
+/// placeholder instead of leaving it missing: a missing leading layer makes MLX build a
+/// sparse array with `.none` holes (crashing `quantize`), and an unloaded placeholder would
+/// otherwise be materialised at full size by `eval(model)`.
+public func outOfSliceParameterKeys(_ model: Module) -> [String] {
     let cfg = PipelineSliceConfig.shared
-    guard let r = cfg.range else { return }
-    let flat = model.parameters().flattened()
-    let total = (flat.compactMap { PipelineSliceConfig.layerIndex(of: $0.0) }.max() ?? -1) + 1
-    var replacement = [String: MLXArray]()
-    for (key, _) in flat {
-        let outOfLayers = cfg.dropsLayer(key: key)
-        let unusedHead = key.contains("lm_head.") && r.upperBound < total
-        let unusedEmbed = key.contains("embed_tokens.") && r.lowerBound > 0 && r.upperBound < total
-        if outOfLayers || unusedHead || unusedEmbed { replacement[key] = MLXArray(0) }
-    }
-    if !replacement.isEmpty {
-        try? model.update(parameters: ModuleParameters.unflattened(replacement), verify: [])
+    guard let r = cfg.range else { return [] }
+    let keys = model.parameters().flattened().map { $0.0 }
+    let total = (keys.compactMap { PipelineSliceConfig.layerIndex(of: $0) }.max() ?? -1) + 1
+    return keys.filter { key in
+        cfg.dropsLayer(key: key)
+            || (key.contains("lm_head.") && r.upperBound < total)
+            || (key.contains("embed_tokens.") && r.lowerBound > 0 && r.upperBound < total)
     }
 }
