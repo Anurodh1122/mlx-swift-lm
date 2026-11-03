@@ -485,7 +485,7 @@ public func loadWeights(
                 let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
                 let cfg = PipelineSliceConfig.shared
                 return try loadModelCheckpoint(urls: loadURLs) {
-                    exclusions.mapName($0) != nil || cfg.dropsLayer(key: $0)
+                    exclusions.mapName($0) != nil && !cfg.dropsLayer(key: $0)
                 }
             }()
             : try loadModelCheckpoint(urls: loadURLs, excludedNamespaces: excludedNamespaces))
