@@ -131,11 +131,13 @@ class Qwen3TransformerBlock: Module {
     }
 }
 
-public class Qwen3ModelInner: Module, LayerPartitionable {
+public class Qwen3ModelInner: Module, LayerPartitionable, PipelineSliceable {
 
 
     // LayerPartitionable
     public var gpuLayerCount: Int?
+    /// llm-mesh pipeline slice; nil = full model.
+    public var pipelineRange: Range<Int>?
     public var totalLayerCount: Int { layers.count }
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
@@ -153,9 +155,22 @@ public class Qwen3ModelInner: Module, LayerPartitionable {
                 Qwen3TransformerBlock(args)
             }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        self.pipelineRange = PipelineSliceConfig.shared.effectiveRange(total: args.hiddenLayers)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        if let range = pipelineRange {
+            // Stage 0 embeds token ids; later stages receive a hidden state [B, L, H].
+            var h = range.lowerBound == 0 ? embedTokens(inputs) : inputs
+            let mask = createAttentionMask(h: h, cache: cache?[range.lowerBound])
+            for i in range {
+                h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount) {
+                    layers[i](h, mask: mask, cache: cache?[i])
+                }
+            }
+            // Only the last stage normalises; others hand the raw hidden state onward.
+            return range.upperBound == layers.count ? norm(h) : h
+        }
         var h = embedTokens(inputs)
 
         let mask = createAttentionMask(h: h, cache: cache?.first)
@@ -212,7 +227,7 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        projectLogits(hiddenStates(inputs, cache: cache))
+        (model.pipelineRange.map { $0.upperBound < model.totalLayerCount } ?? false) ? hiddenStates(inputs, cache: cache) : projectLogits(hiddenStates(inputs, cache: cache))
     }
 
     public func nextTokenLogits(

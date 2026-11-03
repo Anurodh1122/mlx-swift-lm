@@ -479,12 +479,37 @@ public func loadWeights(
         // Load lazily: the concurrent loader reads every tensor, including the experts
         // that SSD streaming pages in on demand, which fills RAM and pushes into swap.
         ? try loadModelCheckpointLazily(urls: loadURLs)
-        : try loadModelCheckpoint(urls: loadURLs, excludedNamespaces: excludedNamespaces)
+        : (PipelineSliceConfig.shared.isActive
+            // llm-mesh: never read tensors of layers outside this slice (peak memory).
+            ? try {
+                let exclusions = CheckpointNameMapping(excludedNamespaces.map { .excludePrefix($0) })
+                let cfg = PipelineSliceConfig.shared
+                return try loadModelCheckpoint(urls: loadURLs) {
+                    exclusions.mapName($0) != nil || cfg.dropsLayer(key: $0)
+                }
+            }()
+            : try loadModelCheckpoint(urls: loadURLs, excludedNamespaces: excludedNamespaces))
     checkpoint.perLayerQuantization = perLayerQuantization
     // per-model cleanup (models can inspect metadata to customize behavior)
     checkpoint = try model.prepareCheckpoint(checkpoint)
 
     var weights = checkpoint.weights
+
+    // llm-mesh: drop tensors for layers outside this process's pipeline slice so they are
+    // never materialised (weights are lazy, so this keeps their memory off the device).
+    let pipelineSliced = PipelineSliceConfig.shared.isActive
+    if pipelineSliced {
+        // Total layer count = highest layer index present in the checkpoint + 1.
+        let total = weights.keys.compactMap { key -> Int? in
+            guard let m = key.range(of: #"\.layers\.(\d+)\."#, options: .regularExpression)
+            else { return nil }
+            return Int(key[m].dropFirst(8).dropLast())
+        }.max().map { $0 + 1 } ?? 0
+        for key in Array(weights.keys)
+        where PipelineSliceConfig.shared.shouldDrop(key: key, totalLayers: total) {
+            weights.removeValue(forKey: key)
+        }
+    }
 
     // ExpertStreamingConfig: Initialize the ExpertStreamerManager when streaming is active.
     // On macOS: pread() from NVMe at ~5 GB/s.
@@ -549,11 +574,12 @@ public func loadWeights(
     // .noUnusedKeys still catches genuinely stray/misspelled keys without requiring
     // every @ModuleInfo slot to be populated up-front.
     let parameters = ModuleParameters.unflattened(weights)
-    if streamsThisModel {
+    if streamsThisModel || pipelineSliced {
         // Expert weights are intentionally absent — paged from SSD on demand.
         // .noUnusedKeys still rejects stray/misspelled keys without requiring
         // every @ModuleInfo slot to be pre-populated.
         try model.update(parameters: parameters, verify: .noUnusedKeys)
+        if pipelineSliced { releaseOutOfSliceParameters(model) }
     } else {
         try model.update(parameters: parameters, verify: .all)
     }

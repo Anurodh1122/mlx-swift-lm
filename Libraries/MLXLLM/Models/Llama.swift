@@ -119,7 +119,7 @@ class LlamaTransformerBlock: Module {
     }
 }
 
-public class LlamaModelInner: Module, LayerPartitionable {
+public class LlamaModelInner: Module, LayerPartitionable, PipelineSliceable {
 
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
@@ -128,6 +128,8 @@ public class LlamaModelInner: Module, LayerPartitionable {
 
     // LayerPartitionable
     public var gpuLayerCount: Int?
+    /// llm-mesh pipeline slice; nil = full model.
+    public var pipelineRange: Range<Int>?
     public var totalLayerCount: Int { layers.count }
 
     init(_ args: LlamaConfiguration) {
@@ -138,9 +140,22 @@ public class LlamaModelInner: Module, LayerPartitionable {
 
         self.layers = (0 ..< args.hiddenLayers).map { _ in LlamaTransformerBlock(args) }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+        self.pipelineRange = PipelineSliceConfig.shared.effectiveRange(total: args.hiddenLayers)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        if let range = pipelineRange {
+            // Stage 0 embeds token ids; later stages receive a hidden state [B, L, H].
+            var h = range.lowerBound == 0 ? embedTokens(inputs) : inputs
+            let mask = createAttentionMask(h: h, cache: cache?[range.lowerBound])
+            for i in range {
+                h = partitionedLayerCall(index: i, gpuLayerCount: gpuLayerCount) {
+                    layers[i](h, mask: mask, cache: cache?[i])
+                }
+            }
+            // Only the last stage normalises; others hand the raw hidden state onward.
+            return range.upperBound == layers.count ? norm(h) : h
+        }
         var h = embedTokens(inputs)
 
         let mask = createAttentionMask(h: h, cache: cache?.first)
@@ -200,6 +215,7 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let out = model(inputs, cache: cache)
+        if let r = model.pipelineRange, r.upperBound < model.totalLayerCount { return out }
         if let lmHead {
             return lmHead(out)
         } else {
