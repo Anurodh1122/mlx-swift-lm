@@ -986,7 +986,7 @@ final class Qwen35DecoderLayer: Module {
 
 // MARK: - Text Model
 
-public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
+public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE, PipelineSliceable {
     @ModuleInfo(key: "embed_tokens") public var embedTokens: Embedding
 
     let layers: [Qwen35DecoderLayer]
@@ -1001,6 +1001,9 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
     
     // StreamableMoE
     public var streamExperts: Bool = false
+
+    /// llm-mesh pipeline slice; nil = full model.
+    public var pipelineRange: Range<Int>? = nil
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -1043,6 +1046,7 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
             })
 
         super.init()
+        self.pipelineRange = PipelineSliceConfig.shared.effectiveRange(total: args.hiddenLayers)
     }
 
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
@@ -1060,28 +1064,36 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
         applyFinalNorm: Bool,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        if applyFinalNorm, inputs.dim(1) == 1, let caches = cache,
+        // The compiled whole-step decode schedule covers every layer; a pipeline slice
+        // must use the plain per-layer loop below.
+        if applyFinalNorm, pipelineRange == nil, inputs.dim(1) == 1, let caches = cache,
             let step = decodeStep(inputs, caches)
         {
             return step
         }
 
-        var hiddenStates = embedTokens(inputs)
+        // Layers this process runs. Stage 0 embeds token ids; later stages receive a hidden
+        // state [B, L, H]. Unsliced: the whole range, identical to the previous behaviour.
+        let sliceRange = pipelineRange ?? (0 ..< layers.count)
+        var hiddenStates = sliceRange.lowerBound == 0 ? embedTokens(inputs) : inputs
 
         var cacheArray = cache
         if cacheArray == nil || cacheArray?.count != layers.count {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
         }
 
+        let faFirst = sliceRange.first(where: { !layers[$0].isLinear })
+        let ssmFirst = sliceRange.first(where: { layers[$0].isLinear })
         let faMask =
-            faIdx.map {
+            faFirst.map {
                 createAttentionMask(h: hiddenStates, cache: cacheArray?[$0])
             } ?? .none
-        let ssmMask = ssmIdx.flatMap {
+        let ssmMask = ssmFirst.flatMap {
             createSSMMask(h: hiddenStates, cache: cacheArray?[$0] as? MambaCache)
         }
 
-        for (i, layer) in layers.enumerated() {
+        for i in sliceRange {
+            let layer = layers[i]
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
                 layer.isLinear
@@ -1093,7 +1105,9 @@ public class Qwen35TextModelInner: Module, LayerPartitionable, StreamableMoE {
             }
         }
 
-        return applyFinalNorm ? norm(hiddenStates) : hiddenStates
+        // Only the last stage normalises; earlier stages hand the raw hidden state onward.
+        return (applyFinalNorm && sliceRange.upperBound == layers.count)
+            ? norm(hiddenStates) : hiddenStates
     }
 
     // MARK: - Whole-step decode schedule
@@ -1293,6 +1307,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = model(inputs, cache: cache)
+        // llm-mesh: a non-final stage returns the hidden state; no output projection.
+        if let r = model.pipelineRange, r.upperBound < model.totalLayerCount { return out }
         if let lmHead {
             out = lmHead(out)
         } else {
